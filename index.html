@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Setback Sketch</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body { margin: 0; height: 100%; font: 13px/1.4 system-ui, -apple-system, Segoe UI, sans-serif; background: #111; }
+  #map { position: absolute; inset: 0; }
+  #map.drawing { cursor: crosshair; touch-action: none; }
+  #panel {
+    position: absolute; top: 10px; left: 10px; z-index: 1000; width: 270px; max-height: calc(100% - 20px);
+    overflow: auto; background: rgba(20,22,26,.92); color: #eee; border-radius: 10px; padding: 12px;
+    box-shadow: 0 4px 20px rgba(0,0,0,.4); box-sizing: border-box;
+  }
+  #panel h1 { font-size: 15px; margin: 0 0 8px; }
+  .row { display: flex; gap: 6px; align-items: center; margin: 8px 0; }
+  .row label { flex: 0 0 auto; }
+  input[type=text], select { flex: 1; min-width: 0; background: #2a2d33; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 5px 7px; font: inherit; }
+  input[type=range] { flex: 1; }
+  button { background: #3a3f48; color: #eee; border: 1px solid #555; border-radius: 6px; padding: 6px 10px; font: inherit; cursor: pointer; }
+  button:hover { background: #474d58; }
+  button.primary { background: #2f6fec; border-color: #2f6fec; }
+  button.primary.on { background: #e8a317; border-color: #e8a317; color: #111; }
+  .seg { display: flex; flex: 1; }
+  .seg button { flex: 1; border-radius: 0; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; }
+  .seg button:last-child { border-radius: 0 6px 6px 0; }
+  .seg button.sel { background: #2f6fec; border-color: #2f6fec; }
+  #info { margin-top: 10px; padding-top: 8px; border-top: 1px solid #333; color: #bbb; }
+  #info b { color: #fff; }
+  .hint { color: #999; font-size: 12px; }
+  .legend span { display: inline-block; width: 12px; height: 3px; vertical-align: middle; margin-right: 4px; }
+  .sb-label { background: rgba(0,0,0,.75); color: #fff; border: none; font-weight: 600; padding: 1px 5px; box-shadow: none; }
+  .sb-label::before { display: none; }
+  @media (max-width: 600px) { #panel { width: auto; right: 10px; top: auto; bottom: 10px; max-height: 45%; } }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>Setback Sketch</h1>
+  <div class="row">
+    <input type="text" id="q" placeholder="Address or lat, lng">
+    <button id="go">Go</button>
+  </div>
+  <div class="row">
+    <button class="primary" id="drawBtn" style="flex:1">✏️ Draw</button>
+    <button id="clearBtn">Clear</button>
+    <button id="linkBtn" title="Copy a link to this exact view">🔗</button>
+  </div>
+  <div class="hint">Click Draw, then press &amp; drag on the map to sketch. Release to finish.</div>
+
+  <div class="row">
+    <label><input type="checkbox" id="closed"> Closed outline</label>
+  </div>
+  <div class="row">
+    <label>Side</label>
+    <div class="seg" id="sideSeg">
+      <button data-v="a" class="sel" id="sideA">Left</button>
+      <button data-v="b" id="sideB">Right</button>
+    </div>
+  </div>
+  <div class="row">
+    <label>Setbacks</label>
+    <input type="text" id="dists" value="20, 60, 100">
+    <select id="units" style="flex:0 0 58px"><option>ft</option><option>m</option></select>
+  </div>
+  <div class="row">
+    <label>Smoothing</label>
+    <input type="range" id="smooth" min="0" max="5" step="0.25" value="1">
+  </div>
+  <div class="row">
+    <label><input type="checkbox" id="band" checked> Shade setback zone</label>
+  </div>
+  <div id="info" class="hint">No line drawn yet.</div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const map = L.map('map', { zoomControl: false }).setView([39.5, -98.35], 5);
+L.control.zoom({ position: 'bottomright' }).addTo(map);
+L.control.scale({ position: 'bottomleft', imperial: true, metric: true }).addTo(map);
+
+const gTiles = lyr => L.tileLayer(`https://mt{s}.google.com/vt/lyrs=${lyr}&x={x}&y={y}&z={z}`,
+  { subdomains: '0123', maxZoom: 22, maxNativeZoom: 21, attribution: 'Imagery © Google' });
+const baseLayers = {
+  'Google Hybrid': gTiles('y'),
+  'Google Satellite': gTiles('s'),
+  'Esri Imagery': L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+    { maxZoom: 22, maxNativeZoom: 19, attribution: 'Imagery © Esri' }),
+};
+const LAYER_KEYS = { hybrid: 'Google Hybrid', sat: 'Google Satellite', esri: 'Esri Imagery' };
+let layerKey = 'hybrid';
+baseLayers[LAYER_KEYS[layerKey]].addTo(map);
+L.control.layers(baseLayers, null, { position: 'topright' }).addTo(map);
+map.on('baselayerchange', e => {
+  layerKey = Object.keys(LAYER_KEYS).find(k => LAYER_KEYS[k] === e.name) || 'hybrid';
+  saveState();
+});
+
+const overlay = L.layerGroup().addTo(map);
+const COLORS = ['#ff4d4d', '#ffb020', '#3ddc84', '#3fa9ff', '#c77dff', '#ff7ab6'];
+
+let drawMode = false, drawing = false, raw = [], rawLine = null, side = 'a';
+
+// ---------- freehand drawing ----------
+const el = map.getContainer();
+function setDraw(on) {
+  drawMode = on;
+  on ? map.dragging.disable() : map.dragging.enable();
+  on ? map.doubleClickZoom.disable() : map.doubleClickZoom.enable();
+  el.classList.toggle('drawing', on);
+  $('drawBtn').classList.toggle('on', on);
+  $('drawBtn').textContent = on ? '✏️ Drawing… (drag)' : '✏️ Draw';
+}
+$('drawBtn').onclick = () => setDraw(!drawMode);
+
+el.addEventListener('pointerdown', e => {
+  if (!drawMode || e.button !== 0 || e.target.closest('.leaflet-control')) return;
+  drawing = true;
+  raw = [map.mouseEventToLatLng(e)];
+  el.setPointerCapture(e.pointerId);
+  overlay.clearLayers();
+  if (rawLine) map.removeLayer(rawLine);
+  rawLine = L.polyline(raw, { color: '#fff', weight: 2, dashArray: '4 4' }).addTo(map);
+  e.preventDefault(); e.stopPropagation();
+}, true);
+el.addEventListener('pointermove', e => {
+  if (!drawing) return;
+  // skip points < 2px from the last one to keep the URL compact
+  const p = map.mouseEventToLatLng(e);
+  if (map.latLngToContainerPoint(p).distanceTo(map.latLngToContainerPoint(raw[raw.length - 1])) < 2) return;
+  raw.push(p);
+  rawLine.setLatLngs(raw);
+  e.stopPropagation();
+}, true);
+el.addEventListener('pointerup', e => {
+  if (!drawing) return;
+  drawing = false;
+  map.removeLayer(rawLine); rawLine = null;
+  if (raw.length > 2) {
+    // auto-close if released near the start point
+    const pS = map.latLngToContainerPoint(raw[0]), pE = map.latLngToContainerPoint(raw[raw.length - 1]);
+    if (pS.distanceTo(pE) < 20) $('closed').checked = true;
+    else if (raw.length > 2) $('closed').checked = false;
+    setDraw(false);
+  }
+  render();
+}, true);
+
+// ---------- geometry ----------
+function baseCoords() {
+  if (raw.length < 2) return null;
+  let pts = raw.map(ll => [ll.lng, ll.lat]);
+  const tolM = +$('smooth').value;
+  if (tolM > 0) {
+    const s = turf.simplify(turf.lineString(pts), { tolerance: tolM / 111320, highQuality: true });
+    pts = s.geometry.coordinates;
+  }
+  // drop consecutive duplicates
+  pts = pts.filter((p, i) => i === 0 || p[0] !== pts[i - 1][0] || p[1] !== pts[i - 1][1]);
+  return pts.length >= 2 ? pts : null;
+}
+
+// One-sided offset of an open line: buffer it, then keep only the buffer boundary
+// points that lie on the chosen side (and not on the round end caps).
+function oneSideOffset(coords, d, sideSign) {
+  const line = turf.lineString(coords);
+  const total = turf.length(line, { units: 'meters' });
+  const buf = turf.buffer(line, d, { units: 'meters', steps: 24 });
+  if (!buf) return [];
+  const polys = buf.geometry.type === 'Polygon' ? [buf.geometry.coordinates] : buf.geometry.coordinates;
+  const cosLat = Math.cos(coords[0][1] * Math.PI / 180);
+  const eps = Math.max(0.01, total * 1e-5);
+  const runs = [];
+  for (const poly of polys) for (const ringClosed of poly) {
+    const ring = ringClosed.slice(0, -1);
+    const info = ring.map(p => {
+      const np = turf.nearestPointOnLine(line, p, { units: 'meters' });
+      const loc = np.properties.location, i = Math.min(np.properties.index, coords.length - 2);
+      if (loc < eps || loc > total - eps) return null;
+      const a = coords[i], b = coords[i + 1];
+      const cross = (b[0] - a[0]) * cosLat * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) * cosLat;
+      return Math.sign(cross) === sideSign ? { p, loc } : null;
+    });
+    let start = info.findIndex(x => !x);
+    if (start < 0) { runs.push(info); continue; }
+    let cur = [];
+    for (let k = 1; k <= info.length; k++) {
+      const x = info[(start + k) % info.length];
+      if (x) cur.push(x); else { if (cur.length > 1) runs.push(cur); cur = []; }
+    }
+  }
+  if (!runs.length) return [];
+  for (const r of runs) if (r[0].loc > r[r.length - 1].loc) r.reverse();
+  // add exact perpendicular end points to the runs touching the line ends
+  const bearingOff = sideSign > 0 ? -90 : 90;
+  const first = runs.reduce((m, r) => r[0].loc < m[0].loc ? r : m);
+  const last = runs.reduce((m, r) => r[r.length - 1].loc > m[m.length - 1].loc ? r : m);
+  const b0 = turf.bearing(coords[0], coords[1]);
+  const b1 = turf.bearing(coords[coords.length - 2], coords[coords.length - 1]);
+  first.unshift({ p: turf.destination(coords[0], d, b0 + bearingOff, { units: 'meters' }).geometry.coordinates, loc: 0 });
+  last.push({ p: turf.destination(coords[coords.length - 1], d, b1 + bearingOff, { units: 'meters' }).geometry.coordinates, loc: total });
+  return runs.map(r => r.map(x => x.p));
+}
+
+function closedOffset(coords, d, outside) {
+  const ring = coords.slice();
+  const a = ring[0], b = ring[ring.length - 1];
+  if (a[0] !== b[0] || a[1] !== b[1]) ring.push(a);
+  if (ring.length < 4) return { rings: [], poly: null };
+  let poly = turf.polygon([ring]);
+  if (turf.kinks(poly).features.length) { // self-intersecting sketch: keep the largest piece
+    const parts = turf.unkinkPolygon(poly).features;
+    poly = parts.reduce((m, p) => turf.area(p) > turf.area(m) ? p : m, parts[0]);
+  }
+  const res = turf.buffer(poly, outside ? d : -d, { units: 'meters', steps: 24 });
+  if (!res) return { rings: [], poly };
+  const polys = res.geometry.type === 'Polygon' ? [res.geometry.coordinates] : res.geometry.coordinates;
+  return { rings: polys.flat(), poly, res };
+}
+
+const ll = c => c.map(p => [p[1], p[0]]);
+
+// ---------- render ----------
+function render() {
+  overlay.clearLayers();
+  const closed = $('closed').checked;
+  $('sideA').textContent = closed ? 'Outside' : 'Left';
+  $('sideB').textContent = closed ? 'Inside' : 'Right';
+
+  saveState();
+  const coords = baseCoords();
+  if (!coords) { $('info').innerHTML = 'No line drawn yet.'; return; }
+
+  const unit = $('units').value, toM = unit === 'ft' ? 0.3048 : 1;
+  const dists = $('dists').value.split(/[,\s]+/).map(Number).filter(x => x > 0).sort((a, b) => a - b);
+  const sideSign = side === 'a' ? 1 : -1;
+  const legend = [];
+  let err = '';
+
+  // base line
+  if (closed) L.polygon(ll(coords), { color: '#fff', weight: 3, fill: false }).addTo(overlay);
+  else {
+    L.polyline(ll(coords), { color: '#fff', weight: 3 }).addTo(overlay);
+    L.circleMarker([coords[0][1], coords[0][0]], { radius: 6, color: '#fff', fillColor: '#2ecc71', fillOpacity: 1, weight: 2 })
+      .bindTooltip('Start').addTo(overlay);
+    L.circleMarker([coords.at(-1)[1], coords.at(-1)[0]], { radius: 6, color: '#fff', fillColor: '#e74c3c', fillOpacity: 1, weight: 2 })
+      .bindTooltip('End').addTo(overlay);
+  }
+
+  const maxD = dists.at(-1);
+  dists.forEach((dv, i) => {
+    const color = COLORS[i % COLORS.length];
+    const d = dv * toM;
+    let lines = [];
+    try {
+      if (closed) {
+        const r = closedOffset(coords, d, side === 'a');
+        lines = r.rings;
+        if (dv === maxD && $('band').checked && r.poly) {
+          const outer = side === 'a' ? r.res : r.poly;
+          const inner = side === 'a' ? r.poly : r.res;
+          let band = outer;
+          if (outer && inner) band = turf.difference(turf.featureCollection([outer, inner])) || outer;
+          if (band) L.geoJSON(band, { style: { stroke: false, fillColor: color, fillOpacity: 0.18 } }).addTo(overlay);
+        }
+      } else {
+        lines = oneSideOffset(coords, d, sideSign);
+        if (dv === maxD && $('band').checked && lines.length === 1) {
+          const ring = [...coords, ...lines[0].slice().reverse()];
+          L.polygon(ll(ring), { stroke: false, fillColor: color, fillOpacity: 0.18 }).addTo(overlay);
+        }
+      }
+    } catch (e) { err = 'Geometry error: ' + e.message; console.error(e); }
+
+    lines.forEach((c, j) => {
+      if (c.length < 2) return;
+      L.polyline(ll(c), { color, weight: 2.5, dashArray: '8 5' }).addTo(overlay);
+      if (j === 0) {
+        const ls = turf.lineString(c);
+        const mid = turf.along(ls, turf.length(ls) * (0.3 + 0.12 * i)).geometry.coordinates;
+        L.tooltip({ permanent: true, direction: 'center', className: 'sb-label' })
+          .setLatLng([mid[1], mid[0]]).setContent(`${dv} ${unit}`).addTo(overlay);
+      }
+    });
+    if (!lines.length && !err) err = `${dv} ${unit}: nothing left (shape too small for that inset).`;
+    legend.push(`<span style="background:${color}"></span>${dv} ${unit}`);
+  });
+
+  // info
+  const lenM = closed
+    ? turf.length(turf.lineString([...coords, coords[0]]), { units: 'meters' })
+    : turf.length(turf.lineString(coords), { units: 'meters' });
+  let html = `${closed ? 'Perimeter' : 'Length'}: <b>${(lenM / toM).toFixed(1)} ${unit}</b>`;
+  if (closed && coords.length >= 3) {
+    const aM = turf.area(turf.polygon([[...coords, coords[0]]]));
+    html += unit === 'ft'
+      ? `<br>Area: <b>${(aM / 0.09290304).toLocaleString(undefined, { maximumFractionDigits: 0 })} ft²</b> (${(aM / 4046.856).toFixed(3)} ac)`
+      : `<br>Area: <b>${aM.toLocaleString(undefined, { maximumFractionDigits: 0 })} m²</b> (${(aM / 10000).toFixed(3)} ha)`;
+  }
+  html += `<br>Vertices: ${coords.length}`;
+  if (legend.length) html += `<div class="legend" style="margin-top:6px">${legend.join(' &nbsp; ')}</div>`;
+  if (!closed) html += `<div style="margin-top:4px">Left/Right is relative to draw direction (green → red).</div>`;
+  if (err) html += `<div style="color:#ff8a8a;margin-top:4px">${err}</div>`;
+  $('info').innerHTML = html;
+}
+
+// ---------- controls ----------
+function setSide(v) {
+  side = v === 'b' ? 'b' : 'a';
+  [...$('sideSeg').children].forEach(x => x.classList.toggle('sel', x.dataset.v === side));
+}
+$('sideSeg').onclick = e => {
+  const b = e.target.closest('button'); if (!b) return;
+  setSide(b.dataset.v);
+  render();
+};
+['closed', 'dists', 'units', 'smooth', 'band'].forEach(id => $(id).addEventListener('input', render));
+$('clearBtn').onclick = () => { raw = []; overlay.clearLayers(); render(); };
+
+async function search() {
+  const q = $('q').value.trim(); if (!q) return;
+  const m = q.match(/^\s*(-?\d+(\.\d+)?)\s*[, ]\s*(-?\d+(\.\d+)?)\s*$/);
+  if (m) { map.setView([+m[1], +m[3]], 19); return; }
+  try {
+    const r = await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&q=' + encodeURIComponent(q));
+    const j = await r.json();
+    if (j[0]) map.setView([+j[0].lat, +j[0].lon], 19); else alert('Not found');
+  } catch { alert('Search failed'); }
+}
+$('go').onclick = search;
+$('q').addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+
+// ---------- URL state (everything lives in the #hash) ----------
+// Google encoded-polyline format (precision 1e6) keeps the drawing compact.
+function encodePoly(pts) {
+  let out = '', pLat = 0, pLng = 0;
+  const enc = v => { v = v < 0 ? ~(v << 1) : v << 1; let s = '';
+    while (v >= 0x20) { s += String.fromCharCode((0x20 | (v & 0x1f)) + 63); v >>= 5; }
+    return s + String.fromCharCode(v + 63); };
+  for (const p of pts) {
+    const lat = Math.round(p.lat * 1e6), lng = Math.round(p.lng * 1e6);
+    out += enc(lat - pLat) + enc(lng - pLng); pLat = lat; pLng = lng;
+  }
+  return out;
+}
+function decodePoly(str) {
+  const pts = []; let i = 0, lat = 0, lng = 0;
+  const dec = () => { let r = 0, sh = 0, b;
+    do { b = str.charCodeAt(i++) - 63; r |= (b & 0x1f) << sh; sh += 5; } while (b >= 0x20);
+    return r & 1 ? ~(r >> 1) : r >> 1; };
+  while (i < str.length) { lat += dec(); lng += dec(); pts.push(L.latLng(lat / 1e6, lng / 1e6)); }
+  return pts;
+}
+
+let restoring = false;
+function saveState() {
+  if (restoring) return;
+  const c = map.getCenter(), z = map.getZoom();
+  const prec = Math.max(4, Math.ceil(Math.log10(2 ** z)) );
+  const p = new URLSearchParams();
+  p.set('map', `${z}/${c.lat.toFixed(prec)}/${c.lng.toFixed(prec)}`);
+  if (layerKey !== 'hybrid') p.set('l', layerKey);
+  p.set('d', $('dists').value.replace(/\s+/g, ''));
+  p.set('u', $('units').value);
+  p.set('s', side);
+  if ($('closed').checked) p.set('c', '1');
+  if ($('smooth').value !== '1') p.set('sm', $('smooth').value);
+  if (!$('band').checked) p.set('b', '0');
+  if (raw.length >= 2) p.set('p', encodePoly(raw));
+  const hash = '#' + p.toString().replace(/%2F/g, '/').replace(/%2C/g, ',');
+  if (location.hash !== hash) history.replaceState(null, '', hash);
+}
+function loadState() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  restoring = true;
+  const m = (p.get('map') || '').split('/').map(Number);
+  if (m.length === 3 && m.every(Number.isFinite)) map.setView([m[1], m[2]], m[0]);
+  const lk = LAYER_KEYS[p.get('l')] ? p.get('l') : 'hybrid';
+  if (lk !== layerKey) {
+    map.removeLayer(baseLayers[LAYER_KEYS[layerKey]]);
+    baseLayers[LAYER_KEYS[lk]].addTo(map);
+    layerKey = lk;
+  }
+  if (p.has('d')) $('dists').value = p.get('d').split(',').join(', ');
+  if (p.get('u') === 'm' || p.get('u') === 'ft') $('units').value = p.get('u');
+  setSide(p.get('s'));
+  $('closed').checked = p.get('c') === '1';
+  $('smooth').value = p.get('sm') ?? '1';
+  $('band').checked = p.get('b') !== '0';
+  try { raw = p.has('p') ? decodePoly(p.get('p')) : []; } catch { raw = []; }
+  // no saved view but a drawing → zoom to it
+  if (m.length !== 3 && raw.length >= 2) map.fitBounds(L.latLngBounds(raw), { padding: [40, 40] });
+  restoring = false;
+  render();
+}
+map.on('moveend', saveState);
+window.addEventListener('hashchange', loadState);
+$('linkBtn').onclick = async () => {
+  saveState();
+  try { await navigator.clipboard.writeText(location.href); $('linkBtn').textContent = '✓'; }
+  catch { prompt('Copy this link:', location.href); }
+  setTimeout(() => $('linkBtn').textContent = '🔗', 1200);
+};
+loadState();
+</script>
+</body>
+</html>
