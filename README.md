@@ -7,6 +7,9 @@ in the URL hash, so any link reopens the exact sketch.
 ## Use
 - **Go**: search an address or paste `lat, lng`
 - **✏️ Draw**: press and drag on the map; release to finish
+- **📐 Polyline**: click to place points; double-click, Enter, or click the first point (closes it) to finish. Esc cancels, Backspace undoes a point
+- **Anchors**: drag to move, drag a ◦ midpoint to add a point, right-click to delete
+- **Convert to anchors**: turns a freehand sketch into editable anchor points
 - **Side**: Left/Right of draw direction (open line) or Outside/Inside (closed outline)
 - **Setbacks**: comma-separated list, ft or m (default 20, 60, 100 ft)
 - **🔗**: copy a shareable link
@@ -19,9 +22,9 @@ It's a single static `index.html` with no build step.
 3. The site appears at `https://<user>.github.io/<repo>/`.
 
 ## URL format
-`#map=<zoom>/<lat>/<lng>&l=<hybrid|sat|esri>&d=20,60,100&u=<ft|m>&s=<a|b>&c=1&sm=1&b=0&p=<encoded polyline>`
+`#map=<zoom>/<lat>/<lng>&l=<hybrid|sat|esri>&d=20,60,100&u=<ft|m>&s=<a|b>&c=1&sm=1&b=0&p=<encoded polyline>&m=v`
 
-`p` is the raw sketch as a Google encoded polyline (1e-6 precision). Parameters at their default values are left out.
+`p` is the drawing as a Google encoded polyline (1e-6 precision). `m=v` means `p` holds exact anchor points; without it, `p` is a freehand sketch that gets smoothed. Parameters at their default values are left out.
 
 ## Notes
 - Libraries load from unpkg (Leaflet 1.9.4, Turf 7). Address search uses OpenStreetMap Nominatim.

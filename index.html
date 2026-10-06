@@ -34,6 +34,12 @@
   .legend span { display: inline-block; width: 12px; height: 3px; vertical-align: middle; margin-right: 4px; }
   .sb-label { background: rgba(0,0,0,.75); color: #fff; border: none; font-weight: 600; padding: 1px 5px; box-shadow: none; }
   .sb-label::before { display: none; }
+  .vtx { background: #fff; border: 3px solid #2f6fec; border-radius: 50%; box-sizing: border-box; cursor: move; }
+  .vtx.first { border-color: #2ecc71; }
+  .vtx.last { border-color: #e74c3c; }
+  .mid { background: rgba(255,255,255,.6); border: 1px solid #2f6fec; border-radius: 50%; box-sizing: border-box; cursor: copy; }
+  button:disabled { opacity: .4; cursor: default; }
+  #map.placing { cursor: crosshair; }
   @media (max-width: 600px) { #panel { width: auto; right: 10px; top: auto; bottom: 10px; max-height: 45%; } }
 </style>
 </head>
@@ -46,11 +52,15 @@
     <button id="go">Go</button>
   </div>
   <div class="row">
-    <button class="primary" id="drawBtn" style="flex:1">✏️ Draw</button>
-    <button id="clearBtn">Clear</button>
+    <button class="primary" id="drawBtn" style="flex:1" title="Freehand: press &amp; drag">✏️ Draw</button>
+    <button class="primary" id="polyBtn" style="flex:1" title="Click to place points">📐 Polyline</button>
+  </div>
+  <div class="row">
+    <button id="clearBtn" style="flex:1">Clear</button>
+    <button id="anchorBtn" style="flex:1" title="Turn the freehand sketch into draggable anchor points">Convert to anchors</button>
     <button id="linkBtn" title="Copy a link to this exact view">🔗</button>
   </div>
-  <div class="hint">Click Draw, then press &amp; drag on the map to sketch. Release to finish.</div>
+  <div class="hint" id="hint">✏️ Draw: press &amp; drag to sketch freehand.<br>📐 Polyline: click to place points; double-click, Enter, or click the first point to finish.<br>Drag anchors to move them, drag a ◦ midpoint to add one, right-click an anchor to delete it.</div>
 
   <div class="row">
     <label><input type="checkbox" id="closed"> Closed outline</label>
@@ -105,11 +115,16 @@ map.on('baselayerchange', e => {
 const overlay = L.layerGroup().addTo(map);
 const COLORS = ['#ff4d4d', '#ffb020', '#3ddc84', '#3fa9ff', '#c77dff', '#ff7ab6'];
 
-let drawMode = false, drawing = false, raw = [], rawLine = null, side = 'a';
+const handles = L.layerGroup().addTo(map);
+
+// mode: 'free' = freehand sketch (smoothed), 'vert' = exact anchor points
+let drawMode = false, drawing = false, raw = [], rawLine = null, side = 'a', mode = 'free';
+let placing = false, ghost = null;
 
 // ---------- freehand drawing ----------
 const el = map.getContainer();
 function setDraw(on) {
+  if (on && placing) setPlacing(false);
   drawMode = on;
   on ? map.dragging.disable() : map.dragging.enable();
   on ? map.doubleClickZoom.disable() : map.doubleClickZoom.enable();
@@ -122,9 +137,11 @@ $('drawBtn').onclick = () => setDraw(!drawMode);
 el.addEventListener('pointerdown', e => {
   if (!drawMode || e.button !== 0 || e.target.closest('.leaflet-control')) return;
   drawing = true;
+  mode = 'free';
   raw = [map.mouseEventToLatLng(e)];
   el.setPointerCapture(e.pointerId);
   overlay.clearLayers();
+  handles.clearLayers();
   if (rawLine) map.removeLayer(rawLine);
   rawLine = L.polyline(raw, { color: '#fff', weight: 2, dashArray: '4 4' }).addTo(map);
   e.preventDefault(); e.stopPropagation();
@@ -152,12 +169,96 @@ el.addEventListener('pointerup', e => {
   render();
 }, true);
 
+// ---------- polyline (click to place anchors) ----------
+function setPlacing(on) {
+  if (on && drawMode) setDraw(false);
+  placing = on;
+  el.classList.toggle('placing', on);
+  $('polyBtn').classList.toggle('on', on);
+  $('polyBtn').textContent = on ? '📐 Finish' : '📐 Polyline';
+  on ? map.doubleClickZoom.disable() : map.doubleClickZoom.enable();
+  if (ghost) { map.removeLayer(ghost); ghost = null; }
+  if (on) { raw = []; mode = 'vert'; $('closed').checked = false; }
+  else if (raw.length < 2) raw = [];
+  render();
+}
+$('polyBtn').onclick = () => setPlacing(!placing);
+function closeAndFinish() { $('closed').checked = true; setPlacing(false); }
+
+map.on('click', e => {
+  if (!placing) return;
+  if (raw.length >= 3 && map.latLngToContainerPoint(raw[0]).distanceTo(e.containerPoint) < 12) return closeAndFinish();
+  raw.push(e.latlng);
+  render();
+});
+map.on('dblclick', () => {
+  if (!placing) return;
+  // both clicks of a double-click added a point; drop the duplicate
+  if (raw.length >= 2 && map.latLngToContainerPoint(raw.at(-1)).distanceTo(map.latLngToContainerPoint(raw.at(-2))) < 6) raw.pop();
+  setPlacing(false);
+});
+map.on('mousemove', e => {
+  if (!placing || !raw.length) return;
+  const pts = [raw.at(-1), e.latlng];
+  if (ghost) ghost.setLatLngs(pts);
+  else ghost = L.polyline(pts, { color: '#fff', weight: 2, dashArray: '4 4', interactive: false }).addTo(map);
+});
+document.addEventListener('keydown', e => {
+  if (!placing || e.target.tagName === 'INPUT') return;
+  if (e.key === 'Enter') setPlacing(false);
+  else if (e.key === 'Escape') { raw = []; setPlacing(false); }
+  else if (e.key === 'Backspace' && raw.length) { raw.pop(); render(); }
+});
+
+// draggable anchors + midpoint "add vertex" handles (anchor mode only)
+function rebuildHandles() {
+  handles.clearLayers();
+  if (mode !== 'vert' || drawing) return;
+  const closed = $('closed').checked, n = raw.length;
+  const icon = (cls, s) => L.divIcon({ className: cls, iconSize: [s, s] });
+  raw.forEach((ll, i) => {
+    let cls = 'vtx';
+    if (!closed && i === 0) cls += ' first';
+    else if (!closed && i === n - 1) cls += ' last';
+    const m = L.marker(ll, { icon: icon(cls, 16), draggable: !placing, autoPan: true, zIndexOffset: 1000 }).addTo(handles);
+    m.on('drag', e => { raw[i] = e.target.getLatLng(); renderShapes(); });
+    m.on('dragend', render);
+    m.on('click', () => { if (placing && i === 0 && n >= 3) closeAndFinish(); });
+    m.on('contextmenu', e => {
+      L.DomEvent.preventDefault(e.originalEvent);
+      if (n > 2) { raw.splice(i, 1); if (raw.length < 3) $('closed').checked = false; render(); }
+    });
+  });
+  if (placing) return;
+  const segs = closed && n >= 3 ? n : n - 1;
+  for (let i = 0; i < segs; i++) {
+    const a = raw[i], b = raw[(i + 1) % n];
+    const m = L.marker([(a.lat + b.lat) / 2, (a.lng + b.lng) / 2], { icon: icon('mid', 11), draggable: true }).addTo(handles);
+    m.on('dragstart', () => raw.splice(i + 1, 0, m.getLatLng()));
+    m.on('drag', e => { raw[i + 1] = e.target.getLatLng(); renderShapes(); });
+    m.on('dragend', render);
+  }
+}
+
+$('anchorBtn').onclick = () => {
+  const c = baseCoords(); if (!c) return;
+  let pts = c;
+  // a closed sketch usually ends right next to its start; merge those
+  if ($('closed').checked && pts.length > 3) {
+    const a = map.latLngToContainerPoint([pts[0][1], pts[0][0]]), b = map.latLngToContainerPoint([pts.at(-1)[1], pts.at(-1)[0]]);
+    if (a.distanceTo(b) < 20) pts = pts.slice(0, -1);
+  }
+  raw = pts.map(p => L.latLng(p[1], p[0]));
+  mode = 'vert';
+  render();
+};
+
 // ---------- geometry ----------
 function baseCoords() {
   if (raw.length < 2) return null;
   let pts = raw.map(ll => [ll.lng, ll.lat]);
   const tolM = +$('smooth').value;
-  if (tolM > 0) {
+  if (mode === 'free' && tolM > 0) {
     const s = turf.simplify(turf.lineString(pts), { tolerance: tolM / 111320, highQuality: true });
     pts = s.geometry.coordinates;
   }
@@ -228,12 +329,19 @@ const ll = c => c.map(p => [p[1], p[0]]);
 
 // ---------- render ----------
 function render() {
+  renderShapes();
+  rebuildHandles();
+  $('smooth').disabled = mode === 'vert';
+  $('anchorBtn').disabled = !(mode === 'free' && raw.length >= 2);
+  saveState();
+}
+
+function renderShapes() {
   overlay.clearLayers();
   const closed = $('closed').checked;
   $('sideA').textContent = closed ? 'Outside' : 'Left';
   $('sideB').textContent = closed ? 'Inside' : 'Right';
 
-  saveState();
   const coords = baseCoords();
   if (!coords) { $('info').innerHTML = 'No line drawn yet.'; return; }
 
@@ -247,9 +355,9 @@ function render() {
   if (closed) L.polygon(ll(coords), { color: '#fff', weight: 3, fill: false }).addTo(overlay);
   else {
     L.polyline(ll(coords), { color: '#fff', weight: 3 }).addTo(overlay);
-    L.circleMarker([coords[0][1], coords[0][0]], { radius: 6, color: '#fff', fillColor: '#2ecc71', fillOpacity: 1, weight: 2 })
+    if (mode === 'free') L.circleMarker([coords[0][1], coords[0][0]], { radius: 6, color: '#fff', fillColor: '#2ecc71', fillOpacity: 1, weight: 2 })
       .bindTooltip('Start').addTo(overlay);
-    L.circleMarker([coords.at(-1)[1], coords.at(-1)[0]], { radius: 6, color: '#fff', fillColor: '#e74c3c', fillOpacity: 1, weight: 2 })
+    if (mode === 'free') L.circleMarker([coords.at(-1)[1], coords.at(-1)[0]], { radius: 6, color: '#fff', fillColor: '#e74c3c', fillOpacity: 1, weight: 2 })
       .bindTooltip('End').addTo(overlay);
   }
 
@@ -373,6 +481,7 @@ function saveState() {
   if ($('smooth').value !== '1') p.set('sm', $('smooth').value);
   if (!$('band').checked) p.set('b', '0');
   if (raw.length >= 2) p.set('p', encodePoly(raw));
+  if (mode === 'vert' && raw.length >= 2) p.set('m', 'v');
   const hash = '#' + p.toString().replace(/%2F/g, '/').replace(/%2C/g, ',');
   if (location.hash !== hash) history.replaceState(null, '', hash);
 }
@@ -394,6 +503,7 @@ function loadState() {
   $('smooth').value = p.get('sm') ?? '1';
   $('band').checked = p.get('b') !== '0';
   try { raw = p.has('p') ? decodePoly(p.get('p')) : []; } catch { raw = []; }
+  mode = p.get('m') === 'v' ? 'vert' : 'free';
   // no saved view but a drawing → zoom to it
   if (m.length !== 3 && raw.length >= 2) map.fitBounds(L.latLngBounds(raw), { padding: [40, 40] });
   restoring = false;
